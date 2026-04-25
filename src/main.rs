@@ -46,7 +46,7 @@ async fn main() {
     println!("Exporting: {}", dir);
     println!();
     println!("Mount with:");
-    println!("  Linux:  mount -t nfs -o nolocks,vers=3,tcp,port={},mountport={} {}:/ <mnt>", port, port, ip);
+    println!("  Linux:  mount -t nfs -o nolock,vers=3,tcp,port={},mountport={} {}:/ <mnt>", port, port, ip);
     println!(
         "  macOS:  mount_nfs -o nolocks,vers=3,tcp,port={},mountport={} {}:/ <mnt>",
         port, port, ip
