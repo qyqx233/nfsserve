@@ -5,6 +5,7 @@ use std::io::SeekFrom;
 use std::ops::Bound;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -201,9 +202,9 @@ impl FSMap {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MirrorFS {
-    fsmap: tokio::sync::Mutex<FSMap>,
+    fsmap: Arc<tokio::sync::Mutex<FSMap>>,
 }
 
 /// Enumeration for the create_fs_object method
@@ -221,7 +222,7 @@ enum CreateFSObject {
 impl MirrorFS {
     pub fn new(root: PathBuf) -> MirrorFS {
         MirrorFS {
-            fsmap: tokio::sync::Mutex::new(FSMap::new(root)),
+            fsmap: Arc::new(tokio::sync::Mutex::new(FSMap::new(root))),
         }
     }
 
