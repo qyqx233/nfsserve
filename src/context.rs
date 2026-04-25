@@ -15,6 +15,8 @@ pub struct RPCContext {
     pub mount_signal: Option<mpsc::Sender<bool>>,
     pub export_name: Arc<String>,
     pub transaction_tracker: Arc<TransactionTracker>,
+    pub allowed_ips: Option<Vec<String>>,
+    pub allowed_uids: Option<Vec<u32>>,
 }
 
 impl fmt::Debug for RPCContext {

@@ -23,6 +23,8 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    allowed_ips: Option<Vec<String>>,
+    allowed_uids: Option<Vec<u32>>,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -159,6 +161,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            allowed_ips: None,
+            allowed_uids: None,
         })
     }
 
@@ -170,6 +174,16 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Default path is `/` if not set.
     pub fn with_export_name<S: AsRef<str>>(&mut self, export_name: S) {
         self.export_name = Arc::new(format!("/{}", export_name.as_ref().trim_end_matches('/').trim_start_matches('/')))
+    }
+
+    /// Sets an optional list of allowed client IP addresses.
+    pub fn with_allowed_ips(&mut self, ips: Vec<String>) {
+        self.allowed_ips = Some(ips);
+    }
+
+    /// Sets an optional list of allowed UIDs for AUTH_UNIX authentication.
+    pub fn with_allowed_uids(&mut self, uids: Vec<u32>) {
+        self.allowed_uids = Some(uids);
     }
 }
 
@@ -204,6 +218,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
+                allowed_ips: self.allowed_ips.clone(),
+                allowed_uids: self.allowed_uids.clone(),
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);

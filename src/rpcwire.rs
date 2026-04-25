@@ -17,6 +17,53 @@ const NFS_ACL_PROGRAM: u32 = 100227;
 const NFS_ID_MAP_PROGRAM: u32 = 100270;
 const NFS_METADATA_PROGRAM: u32 = 200024;
 
+fn auth_error_reply(xid: u32, stat: auth_stat) -> rpc_msg {
+    let reply = reply_body::MSG_DENIED(rejected_reply::AUTH_ERROR(stat));
+    rpc_msg {
+        xid,
+        body: rpc_body::REPLY(reply),
+    }
+}
+
+fn check_auth(xid: u32, call: &call_body, context: &RPCContext, output: &mut impl Write) -> Result<bool, anyhow::Error> {
+    // 1. IP whitelist check
+    if let Some(ref allowed_ips) = context.allowed_ips {
+        let client_ip = context.client_addr.split(':').next().unwrap_or(&context.client_addr);
+        if !allowed_ips.iter().any(|ip| ip == client_ip) {
+            warn!("Auth failed: IP {} not in allowed list", client_ip);
+            auth_error_reply(xid, auth_stat::AUTH_TOOWEAK).serialize(output)?;
+            return Ok(true);
+        }
+    }
+
+    // 2. Auth flavor and credential check
+    match call.cred.flavor {
+        auth_flavor::AUTH_NULL => {
+            if context.allowed_uids.is_some() {
+                warn!("Auth failed: AUTH_NULL not allowed (uid whitelist configured)");
+                auth_error_reply(xid, auth_stat::AUTH_BADCRED).serialize(output)?;
+                return Ok(true);
+            }
+        }
+        auth_flavor::AUTH_UNIX => {
+            if let Some(ref allowed_uids) = context.allowed_uids {
+                if !allowed_uids.contains(&context.auth.uid) {
+                    warn!("Auth failed: uid {} not in allowed list", context.auth.uid);
+                    auth_error_reply(xid, auth_stat::AUTH_BADCRED).serialize(output)?;
+                    return Ok(true);
+                }
+            }
+        }
+        _ => {
+            warn!("Auth failed: unsupported auth flavor {:?}", call.cred.flavor);
+            auth_error_reply(xid, auth_stat::AUTH_BADCRED).serialize(output)?;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 async fn handle_rpc(
     input: &mut impl Read,
     output: &mut impl Write,
@@ -42,6 +89,11 @@ async fn handle_rpc(
             // Drop the message and return
             debug!("Retransmission detected, xid: {}, client_addr: {}, call: {:?}", xid, context.client_addr, call);
             return Ok(false);
+        }
+
+        // Auth check
+        if check_auth(xid, &call, &context, output)? {
+            return Ok(true);
         }
 
         let res = {
