@@ -33,6 +33,7 @@ axum = "0.8.9"
 tower-http = { version = "0.6.8", features = ["trace"] }
 bytes = "1.11.1"
 futures-util = "0.3.32"
+base64 = "0.22"
 
 [features]
 strict = []

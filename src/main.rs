@@ -3,6 +3,10 @@ mod webdav;
 
 use std::path::PathBuf;
 
+use axum::extract::{Extension, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 use mirrorfs::MirrorFS;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
@@ -23,7 +27,10 @@ async fn main() {
         eprintln!("  nfs-bind-address   Host:port for NFS (default: 0.0.0.0:2049)");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --dav-port <port>  Enable WebDAV on the given port");
+        eprintln!("  --dav-port <port>  Enable WebDAV on the given port (binds 0.0.0.0)");
+        eprintln!("  --dav-bind <addr>  Enable WebDAV on a specific host:port (overrides --dav-port)");
+        eprintln!("  --username <user>  WebDAV username (requires --password)");
+        eprintln!("  --password <pass>  WebDAV password (requires --username)");
         eprintln!("  --allow-ip <ips>   Comma-separated list of allowed client IPs (NFS only)");
         eprintln!("  --allow-uid <uids> Comma-separated list of allowed UIDs (NFS only)");
         eprintln!();
@@ -31,14 +38,19 @@ async fn main() {
         eprintln!("  {} /data                          # NFS only", args[0]);
         eprintln!("  {} /data --dav-port 8080          # WebDAV only", args[0]);
         eprintln!("  {} /data 0.0.0.0:2049 --dav-port 8080  # Both NFS + WebDAV", args[0]);
+        eprintln!("  {} /data --dav-port 8080 --username admin --password secret", args[0]);
+        eprintln!("  {} /data --dav-bind 127.0.0.1:8080 --username admin --password secret", args[0]);
         std::process::exit(1);
     }
 
     let mut dir: Option<String> = None;
     let mut nfs_bind = "0.0.0.0:2049".to_string();
     let mut dav_port: Option<u16> = None;
+    let mut dav_bind: Option<String> = None;
     let mut allowed_ips: Vec<String> = Vec::new();
     let mut allowed_uids: Vec<u32> = Vec::new();
+    let mut username: Option<String> = None;
+    let mut password: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -47,6 +59,24 @@ async fn main() {
                 i += 1;
                 if i < args.len() {
                     dav_port = args[i].parse().ok();
+                }
+            }
+            "--dav-bind" => {
+                i += 1;
+                if i < args.len() {
+                    dav_bind = Some(args[i].clone());
+                }
+            }
+            "--username" => {
+                i += 1;
+                if i < args.len() {
+                    username = Some(args[i].clone());
+                }
+            }
+            "--password" => {
+                i += 1;
+                if i < args.len() {
+                    password = Some(args[i].clone());
                 }
             }
             "--allow-ip" => {
@@ -83,26 +113,32 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Validate auth options
+    let creds = match (username, password) {
+        (Some(u), Some(p)) => Some((u, p)),
+        (None, None) => None,
+        _ => {
+            eprintln!("Error: --username and --password must be provided together");
+            std::process::exit(1);
+        }
+    };
+
     let fs = MirrorFS::new(path.clone());
 
     // Start WebDAV if requested
-    let dav_handle = if let Some(port) = dav_port {
+    let dav_handle = if dav_bind.is_some() || dav_port.is_some() {
+        let addr = dav_bind.unwrap_or_else(|| format!("0.0.0.0:{}", dav_port.unwrap()));
         let dav_fs = webdav::MirrorDavFS::new(fs.clone());
         let dav_handler = dav_fs.build_handler();
-        let addr = format!("0.0.0.0:{}", port);
+        let creds_clone = creds.clone();
         Some(tokio::spawn(async move {
-            run_dav_server(&addr, dav_handler).await;
+            run_dav_server(&addr, dav_handler, creds_clone).await;
         }))
     } else {
         None
     };
 
-    // Start NFS if no --dav-port-only mode, or if nfs_bind is explicitly set
-    // Actually, always start NFS unless user only wants WebDAV?
-    // For now: start NFS always, unless --dav-port is set but no nfs_bind is given.
-    // Wait, the logic is simpler: if user provides [nfs-bind-address], start NFS.
-    // But default is to start NFS on 0.0.0.0:2049.
-    // Let's start NFS always, it's the primary purpose of this binary.
+    // Start NFS always, it's the primary purpose of this binary.
     let nfs_handle = tokio::spawn(async move {
         let mut listener = NFSTcpListener::bind(&nfs_bind, fs).await.unwrap_or_else(|e| {
             eprintln!("Error: failed to bind NFS to {}: {}", nfs_bind, e);
@@ -151,11 +187,15 @@ async fn main() {
     }
 }
 
-async fn run_dav_server(addr: &str, handler: dav_server::DavHandler) {
-    use axum::extract::{Request, State};
+async fn run_dav_server(
+    addr: &str,
+    handler: dav_server::DavHandler,
+    creds: Option<(String, String)>,
+) {
     use axum::response::IntoResponse;
     use axum::routing::any;
     use axum::Router;
+    use base64::Engine;
     use tokio::net::TcpListener;
     use tower_http::trace::TraceLayer;
 
@@ -166,10 +206,45 @@ async fn run_dav_server(addr: &str, handler: dav_server::DavHandler) {
         handler.handle(req).await
     }
 
+    async fn basic_auth_middleware(
+        Extension(creds): Extension<Option<(String, String)>>,
+        req: Request,
+        next: Next,
+    ) -> Result<Response, StatusCode> {
+        if let Some((expected_user, expected_pass)) = creds {
+            let auth_header = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+
+            if !auth_header.starts_with("Basic ") {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&auth_header[6..])
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let decoded = String::from_utf8(decoded).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+            let mut parts = decoded.splitn(2, ':');
+            let user = parts.next().unwrap_or("");
+            let pass = parts.next().unwrap_or("");
+
+            if user != expected_user || pass != expected_pass {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+
+        Ok(next.run(req).await)
+    }
+
     let app = Router::new()
         .fallback(any(dav_handler))
+        .with_state(handler)
         .layer(TraceLayer::new_for_http())
-        .with_state(handler);
+        .layer(axum::middleware::from_fn(basic_auth_middleware))
+        .layer(Extension(creds.clone()));
 
     let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
         eprintln!("Error: failed to bind WebDAV to {}: {}", addr, e);
@@ -177,6 +252,11 @@ async fn run_dav_server(addr: &str, handler: dav_server::DavHandler) {
     });
     let local_addr = listener.local_addr().unwrap();
     println!("WebDAV server listening on http://{}", local_addr);
+    if creds.is_some() {
+        println!("WebDAV authentication: enabled (Basic Auth)");
+    } else {
+        println!("WebDAV authentication: disabled");
+    }
     println!();
     println!("WebDAV mount:");
     println!("  Linux:  mount -t davfs http://{}/ <mnt>", local_addr);
@@ -191,5 +271,3 @@ async fn run_dav_server(addr: &str, handler: dav_server::DavHandler) {
         std::process::exit(1);
     });
 }
-
-
